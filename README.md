@@ -16,7 +16,8 @@ simpler MSI Afterburner-style monitor).
   - **GPU (NVIDIA):** uses `nvidia-smi` to lock the GPU clock range and set the lowest allowed power limit.
   - **Screen:** turns the monitor off sooner when idle.
 - **Live power overlay**: *Simple* (total CPU+GPU watts only) or *Advanced* (watts, volts, temperature, clock and load
-  for CPU and GPU, the peak since you switched on, and FPS). Click-through, always on top, any screen corner. It appears
+  for CPU and GPU, the peak since you switched on, and FPS). It also shows whether saver mode is on or off (green
+  "SAVER ON" / amber "SAVER OFF"). Click-through, always on top, any screen corner. It appears
   automatically while saver mode is on, and you can show or hide it at any time with `Ctrl+Alt+O` (even with saver mode
   OFF) to check current usage. A setting keeps it on permanently.
 - **FPS counter** for the game in the foreground (frame rate and frame time), read from Windows present events with the

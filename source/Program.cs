@@ -822,7 +822,10 @@ namespace UpsPowerSaver
                 string adv = SummaryText(s);                      // also tracks the peak
                 string simple = string.Format("{0:0.0} W", (s.CpuW ?? 0) + (s.GpuW ?? 0));
                 if (cfg.ShowFps && s.Fps.HasValue) simple += "  " + s.Fps.Value.ToString("0") + " FPS";
-                ovLabel.Text = cfg.OverlayMode == "Simple" ? simple : adv;
+                // saver mode indicator: green text + "SAVER ON", amber text + "SAVER OFF"
+                string tag = on ? "SAVER ON" : "SAVER OFF";
+                ovLabel.ForeColor = on ? Color.FromArgb(120, 255, 140) : Color.FromArgb(255, 190, 80);
+                ovLabel.Text = cfg.OverlayMode == "Simple" ? simple + "  " + tag : tag + "\r\n" + adv;
             }
             PlaceOverlay();
         }
@@ -1020,6 +1023,7 @@ namespace UpsPowerSaver
             }
             catch (Exception ex) { tray.ShowBalloonTip(5000, "UPS Power Saver", ex.Message, ToolTipIcon.Error); }
             RefreshState();
+            if (overlay.Visible) UpdateOverlay();       // flip the SAVER ON/OFF indicator right away
         }
 
         void OpenSettings()

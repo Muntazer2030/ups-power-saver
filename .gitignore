@@ -1,8 +1,9 @@
 # build output
 *.exe
 dist/
-# third-party DLLs are downloaded by source/Get-Libs.ps1
+# third-party binaries are downloaded by source/Get-Libs.ps1
 source/lib/
+source/tools/
 # local files
 old-powershell-version/
 *.log

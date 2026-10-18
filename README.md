@@ -15,11 +15,14 @@ simpler MSI Afterburner-style monitor).
     energy-saving preference. Your previous plan is restored when you toggle off.
   - **GPU (NVIDIA):** uses `nvidia-smi` to lock the GPU clock range and set the lowest allowed power limit.
   - **Screen:** turns the monitor off sooner when idle.
-- **Live power overlay** while saver mode is on: *Simple* (total CPU+GPU watts only) or *Advanced* (watts, volts,
-  temperature, clock and load for CPU and GPU, plus the peak since you switched on). Click-through, always on top,
-  any screen corner.
+- **Live power overlay**: *Simple* (total CPU+GPU watts only) or *Advanced* (watts, volts, temperature, clock and load
+  for CPU and GPU, the peak since you switched on, and FPS). Click-through, always on top, any screen corner. It appears
+  automatically while saver mode is on, and you can show or hide it at any time with `Ctrl+Alt+O` (even with saver mode
+  OFF) to check current usage. A setting keeps it on permanently.
+- **FPS counter** for the game in the foreground (frame rate and frame time), read from Windows present events with the
+  bundled [PresentMon](https://github.com/GameTechDev/PresentMon) tool. Nothing is injected into games, so it is safe with anti-cheat.
 - **Stats window** (`Ctrl+Alt+W`): every sensor with current, min and max values: CPU package/core power, Vcore and board voltages, temperatures, clocks, loads.
-- **Settings window:** limits, overlay mode/corner/size, and both shortcuts (click the box and press the keys you want).
+- **Settings window:** limits, overlay options, FPS on/off, and all three shortcuts (click the box and press the keys you want).
 - **Starts with Windows** (hidden in the tray) so the shortcut is always ready. Can be turned off in Settings.
 - Single `.exe`, no installer. Exit from the tray menu restores normal power.
 
@@ -39,6 +42,7 @@ simpler MSI Afterburner-style monitor).
 | Action | How |
 |---|---|
 | Toggle saver mode | `Ctrl+Alt+U` (or the big button in the window, or tray menu) |
+| Show / hide the overlay (any time) | `Ctrl+Alt+O`, the **Overlay on/off** button, or tray menu |
 | Open the stats window | `Ctrl+Alt+W` or double-click the tray icon |
 | Switch overlay Simple/Advanced | button in the window or tray menu |
 | Change limits/shortcuts | **Settings** in the window or tray menu |
@@ -60,7 +64,10 @@ Settings are stored in `%APPDATA%\UPSPowerSaver\settings.ini`.
 - Windows 10/11, x64, administrator rights (the app asks for them).
 - GPU limits need an **NVIDIA** GPU with `nvidia-smi` (Turing or newer for clock locking). The CPU limits use standard Windows power settings and should work with Intel and AMD, but everything was only tested on Intel.
 - Tested on Windows 11 with an Intel Core i5-14400F and NVIDIA RTX 5060. Other hardware may differ; please open an issue.
-- Exclusive-fullscreen games can hide the overlay (borderless/windowed works).
+- **Overlay in games:** it is a normal always-on-top window (re-asserted every quarter second), so it should show over
+  windowed and borderless/"fullscreen optimized" games (reports from more games and GPUs are welcome). Games in true **exclusive fullscreen** hide every normal window;
+  switch the game to *Borderless* or *Windowed fullscreen* to see the overlay. (Showing it in exclusive fullscreen would need code injection into the game, which this app deliberately avoids.)
+- **FPS** is shown only for the foreground app that is presenting frames (DirectX/OpenGL/Vulkan, windowed or borderless), and never for programs on an ignore list (browsers, chat apps, editors, Explorer...). The app name is not shown on the overlay. Add or remove programs in the `FpsIgnore=` line of `settings.ini`.
 - This changes power-management settings and locks GPU clocks while ON. It does not overclock or undervolt anything. Use at your own risk.
 
 ## Build from source
@@ -70,7 +77,7 @@ Needs only Windows PowerShell (the C# compiler ships with Windows).
 ```powershell
 git clone https://github.com/Muntazer2030/ups-power-saver.git
 cd ups-power-saver
-.\source\Build.ps1 -Package     # downloads LibreHardwareMonitor (hash-checked), builds the exe, makes dist\*.zip
+.\source\Build.ps1 -Package     # downloads LibreHardwareMonitor + PresentMon (hash-checked), builds the exe, makes dist\*.zip
 ```
 
 ## How it works
@@ -79,6 +86,8 @@ cd ups-power-saver
 - GPU limits use `nvidia-smi -pl` / `-lgc` and are reset with `-rgc` / the GPU's default power limit.
 - Sensors come from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor), embedded in the exe (see
   [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
+- FPS comes from Intel's [PresentMon](https://github.com/GameTechDev/PresentMon) console tool, embedded in the exe and started only while the
+  overlay or window is visible. It is extracted to `%APPDATA%\UPSPowerSaver` and byte-checked against the embedded copy before every launch.
 
 ## License
 

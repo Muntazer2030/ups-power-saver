@@ -85,7 +85,10 @@ namespace UpsPowerSaver
         public int OverlayOpacity = 85, OverlayFont = 11;
         public bool DisableBoost = true, ShowOverlay = true, AutoStart = true;
         public string Corner = "TopLeft";
-        public string ToggleHotkey = "Ctrl+Alt+U", StatsHotkey = "Ctrl+Alt+W";
+        public bool ShowFps = true, AlwaysOverlay = false;
+        // FPS is never shown for these programs (browsers, chat, editors...). Comma-separated exe names; edit in settings.ini.
+        public string FpsIgnore = "claude.exe,chrome.exe,msedge.exe,firefox.exe,brave.exe,opera.exe,vivaldi.exe,code.exe,cursor.exe,devenv.exe,unity.exe,unityhub.exe,blender.exe,discord.exe,spotify.exe,teams.exe,ms-teams.exe,slack.exe,telegram.exe,whatsapp.exe,notepad.exe,windowsterminal.exe,powershell.exe,cmd.exe,explorer.exe,applicationframehost.exe,steamwebhelper.exe,taskmgr.exe,vlc.exe,mpv.exe,winword.exe,excel.exe,powerpnt.exe,onenote.exe,mspaint.exe,ups power saver.exe";
+        public string ToggleHotkey = "Ctrl+Alt+U", StatsHotkey = "Ctrl+Alt+W", OverlayHotkey = "Ctrl+Alt+O";
         public string OverlayMode = "Advanced";   // Simple = total watts only, Advanced = CPU/GPU details
 
         public static string Dir
@@ -131,6 +134,10 @@ namespace UpsPowerSaver
                         case "OverlayMode": if (v == "Simple" || v == "Advanced") s.OverlayMode = v; break;
                         case "ToggleHotkey": if (HotkeyDef.Parse(v) != null) s.ToggleHotkey = v; break;
                         case "StatsHotkey": if (HotkeyDef.Parse(v) != null) s.StatsHotkey = v; break;
+                        case "OverlayHotkey": if (HotkeyDef.Parse(v) != null) s.OverlayHotkey = v; break;
+                        case "ShowFps": s.ShowFps = v == "1"; break;
+                        case "FpsIgnore": s.FpsIgnore = v; break;
+                        case "AlwaysShowOverlay": s.AlwaysOverlay = v == "1"; break;
                     }
                 }
             }
@@ -157,6 +164,10 @@ namespace UpsPowerSaver
             b.AppendLine("AutoStart=" + (AutoStart ? 1 : 0) + "   # start with Windows");
             b.AppendLine("ToggleHotkey=" + ToggleHotkey);
             b.AppendLine("StatsHotkey=" + StatsHotkey);
+            b.AppendLine("OverlayHotkey=" + OverlayHotkey + "   # show/hide the overlay any time, even with saver mode OFF");
+            b.AppendLine("AlwaysShowOverlay=" + (AlwaysOverlay ? 1 : 0));
+            b.AppendLine("ShowFps=" + (ShowFps ? 1 : 0) + "   # needs the bundled PresentMon tool");
+            b.AppendLine("FpsIgnore=" + FpsIgnore);
             File.WriteAllText(FilePath, b.ToString());
         }
     }
@@ -286,7 +297,152 @@ namespace UpsPowerSaver
         public double? Val { get { return S.Value.HasValue ? (double?)S.Value.Value : null; } }
     }
 
-    class Snap { public double? CpuW, CpuV, CpuT, CpuClk, CpuLoad, GpuW, GpuV, GpuT, GpuClk, GpuLoad; }
+    class Snap
+    {
+        public double? CpuW, CpuV, CpuT, CpuClk, CpuLoad, GpuW, GpuV, GpuT, GpuClk, GpuLoad;
+        public double? Fps, FrameMs;
+        public string FpsApp;
+    }
+
+    // ------------------------------------------------------------------ FPS (Intel PresentMon, bundled)
+    // PresentMon watches the Windows present events through ETW (no injection into games, anti-cheat safe).
+    class FpsReader
+    {
+        class Stat { public Queue<double> Ms = new Queue<double>(); public double Sum; public string App; public long LastTick; }
+
+        Process proc;
+        readonly Dictionary<int, Stat> stats = new Dictionary<int, Stat>();
+        readonly object lk = new object();
+        long retryAfter;
+        const string Session = "UPSPowerSaver";
+        static readonly string[] Ignore = { "dwm.exe", "explorer.exe", "searchhost.exe", "textinputhost.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe" };
+
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+
+        static string ExePath { get { return Path.Combine(Settings.Dir, "PresentMon.exe"); } }
+
+        public bool Running { get { try { return proc != null && !proc.HasExited; } catch { return false; } } }
+
+        static byte[] Embedded()
+        {
+            using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream("tool_PresentMon.exe"))
+            {
+                if (s == null) return null;
+                byte[] b = new byte[s.Length]; int off = 0;
+                while (off < b.Length) off += s.Read(b, off, b.Length - off);
+                return b;
+            }
+        }
+
+        // The tool runs elevated, so only ever run a file that is byte-identical to the one embedded in this exe.
+        static bool EnsureTool()
+        {
+            byte[] emb = Embedded();
+            if (emb == null) return false;
+            try
+            {
+                bool same = File.Exists(ExePath) && File.ReadAllBytes(ExePath).SequenceEqual(emb);
+                if (!same) File.WriteAllBytes(ExePath, emb);
+                return true;
+            }
+            catch (Exception ex) { Diag.Log("PresentMon extract failed: " + ex.Message); return false; }
+        }
+
+        public void Start()
+        {
+            if (Running || Environment.TickCount < retryAfter) return;
+            retryAfter = Environment.TickCount + 30000;
+            if (!EnsureTool()) return;
+            KillStale();
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(ExePath,
+                    "--output_stdout --no_console_stats --v1_metrics --stop_existing_session --session_name " + Session + " --no_track_gpu --no_track_input --exclude dwm.exe");
+                psi.UseShellExecute = false; psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true; psi.RedirectStandardError = true;
+                proc = Process.Start(psi);
+                Process p = proc;
+                lock (lk) stats.Clear();
+                Thread t = new Thread(delegate() { Read(p); }); t.IsBackground = true; t.Start();
+                Thread e = new Thread(delegate() { try { p.StandardError.ReadToEnd(); } catch { } }); e.IsBackground = true; e.Start();
+                Diag.Log("PresentMon started");
+            }
+            catch (Exception ex) { Diag.Log("PresentMon start failed: " + ex.Message); proc = null; }
+        }
+
+        // A copy left running by an earlier instance that was killed (e.g. from Task Manager).
+        static void KillStale()
+        {
+            foreach (Process p in Process.GetProcessesByName("PresentMon"))
+            {
+                try { if (string.Equals(p.MainModule.FileName, ExePath, StringComparison.OrdinalIgnoreCase)) p.Kill(); } catch { }
+            }
+        }
+
+        public void Stop()
+        {
+            try { if (proc != null && !proc.HasExited) proc.Kill(); } catch { }
+            proc = null;
+            if (File.Exists(ExePath))
+                Power.Run(ExePath, "--session_name " + Session + " --terminate_existing_session");   // end the ETW session
+            lock (lk) stats.Clear();
+        }
+
+        void Read(Process p)
+        {
+            try
+            {
+                int iApp = -1, iPid = -1, iMs = -1;
+                string line;
+                while ((line = p.StandardOutput.ReadLine()) != null)
+                {
+                    string[] f = line.Split(',');
+                    if (iPid < 0)
+                    {
+                        for (int i = 0; i < f.Length; i++)
+                        {
+                            string n = f[i].Trim().ToLowerInvariant();
+                            if (n == "application") iApp = i; else if (n == "processid") iPid = i; else if (n == "msbetweenpresents") iMs = i;
+                        }
+                        if (iPid >= 0 && iMs >= 0 && iApp >= 0) continue;
+                        iPid = -1; continue;
+                    }
+                    int pid; double ms;
+                    if (f.Length <= Math.Max(iMs, Math.Max(iApp, iPid))) continue;
+                    if (!int.TryParse(f[iPid], out pid) || !double.TryParse(f[iMs], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ms) || ms <= 0) continue;
+                    lock (lk)
+                    {
+                        Stat s;
+                        if (!stats.TryGetValue(pid, out s)) { s = new Stat(); stats[pid] = s; }
+                        s.App = f[iApp]; s.LastTick = Environment.TickCount;
+                        s.Ms.Enqueue(ms); s.Sum += ms;
+                        while (s.Ms.Count > 2 && s.Sum - s.Ms.Peek() >= 1000) s.Sum -= s.Ms.Dequeue();
+                    }
+                }
+            }
+            catch (Exception ex) { Diag.Log("PresentMon reader ended: " + ex.Message); }
+        }
+
+        // Frame rate of the foreground app, if it is presenting frames and is not on the ignore list
+        // (browsers, chat apps, editors...). Nothing else is ever reported, so background apps never show up.
+        public void Fill(Snap s, string ignoreList)
+        {
+            uint fg = 0; GetWindowThreadProcessId(GetForegroundWindow(), out fg);
+            lock (lk)
+            {
+                Stat f;
+                if (!stats.TryGetValue((int)fg, out f) || Environment.TickCount - f.LastTick >= 2000 || f.Ms.Count < 2) return;
+                string app = (f.App ?? "").ToLowerInvariant();
+                if (Ignore.Contains(app)) return;
+                foreach (string n in (ignoreList ?? "").Split(','))
+                    if (n.Trim().Length > 0 && n.Trim().ToLowerInvariant() == app) return;
+                s.FrameMs = f.Sum / f.Ms.Count;
+                s.Fps = 1000.0 / s.FrameMs.Value;
+                s.FpsApp = f.App;
+            }
+        }
+    }
 
     class Sensors
     {
@@ -433,7 +589,7 @@ namespace UpsPowerSaver
             if (d == null) return -1;
             return RegisterHotKey(Handle, id, d.Mods | 0x4000, d.Vk) ? 0 : Marshal.GetLastWin32Error();
         }
-        public void UnregisterAll() { UnregisterHotKey(Handle, 1); UnregisterHotKey(Handle, 2); }
+        public void UnregisterAll() { UnregisterHotKey(Handle, 1); UnregisterHotKey(Handle, 2); UnregisterHotKey(Handle, 3); }
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == 0x312 && Hotkey != null) Hotkey(m.WParam.ToInt32());
@@ -446,7 +602,8 @@ namespace UpsPowerSaver
         NumericUpDown cpuMax, cpuMin, gpuMax, gpuMin, gpuW, dispOff, opac, font;
         CheckBox boost, overlay, autostart;
         ComboBox corner, mode;
-        HotkeyBox toggleKey, statsKey;
+        HotkeyBox toggleKey, statsKey, overlayKey;
+        CheckBox alwaysOverlay, showFps;
         public Settings Result;
 
         HotkeyBox Key(string label, int y, string value)
@@ -474,6 +631,7 @@ namespace UpsPowerSaver
             int y = 14;
             toggleKey = Key("Shortcut: toggle saver mode", y, s.ToggleHotkey); y += 32;
             statsKey = Key("Shortcut: open window", y, s.StatsHotkey); y += 32;
+            overlayKey = Key("Shortcut: show/hide overlay", y, s.OverlayHotkey); y += 32;
             autostart = new CheckBox { Text = "Start automatically with Windows", Left = 14, Top = y, Width = 360, Checked = s.AutoStart }; Controls.Add(autostart); y += 40;
             cpuMax = Num("CPU max speed (%)", y, 5, 100, s.CpuMax, "lower = less power"); y += 32;
             cpuMin = Num("CPU min speed (%)", y, 0, 100, s.CpuMin, ""); y += 32;
@@ -488,6 +646,8 @@ namespace UpsPowerSaver
             corner.Items.AddRange(new object[] { "TopLeft", "TopRight", "BottomLeft", "BottomRight" });
             corner.SelectedItem = s.Corner; if (corner.SelectedIndex < 0) corner.SelectedIndex = 0;
             Controls.Add(corner); y += 32;
+            alwaysOverlay = new CheckBox { Text = "Always show overlay (even when saver mode is OFF)", Left = 14, Top = y, Width = 480, Checked = s.AlwaysOverlay }; Controls.Add(alwaysOverlay); y += 28;
+            showFps = new CheckBox { Text = "Show FPS in the overlay (games must be borderless/windowed)", Left = 14, Top = y, Width = 480, Checked = s.ShowFps }; Controls.Add(showFps); y += 32;
             Controls.Add(new Label { Text = "Overlay shows", Left = 14, Top = y + 3, Width = 220 });
             mode = new ComboBox { Left = 240, Top = y, Width = 120, DropDownStyle = ComboBoxStyle.DropDownList };
             mode.Items.AddRange(new object[] { "Simple", "Advanced" });
@@ -511,6 +671,8 @@ namespace UpsPowerSaver
                 r.OverlayMode = (string)mode.SelectedItem; r.AutoStart = autostart.Checked;
                 if (HotkeyDef.Parse(toggleKey.Text) != null) r.ToggleHotkey = toggleKey.Text;
                 if (HotkeyDef.Parse(statsKey.Text) != null) r.StatsHotkey = statsKey.Text;
+                if (HotkeyDef.Parse(overlayKey.Text) != null) r.OverlayHotkey = overlayKey.Text;
+                r.AlwaysOverlay = alwaysOverlay.Checked; r.ShowFps = showFps.Checked;
                 Result = r;
             };
         }
@@ -546,6 +708,8 @@ namespace UpsPowerSaver
         ToolStripMenuItem startupItem, modeItem;
 
         static readonly string Deg = "°";
+        readonly FpsReader fps = new FpsReader();
+        bool overlayPinned;     // overlay was switched on by hand, so it stays when saver mode goes OFF
 
         public AppContext(bool trayOnly)
         {
@@ -585,7 +749,7 @@ namespace UpsPowerSaver
 
             on = Power.IsOn();          // e.g. app was closed/crashed while ON
             RefreshState();
-            if (on && cfg.ShowOverlay) ShowOverlay();
+            if (cfg.AlwaysOverlay || (on && cfg.ShowOverlay)) ShowOverlay();
 
             timer.Interval = 250;
             timer.Tick += OnTick;
@@ -624,7 +788,23 @@ namespace UpsPowerSaver
             UpdateOverlay();
             overlay.Show();
         }
-        void ToggleOverlay() { if (overlay.Visible) overlay.Hide(); else ShowOverlay(); }
+        // Manual show/hide (shortcut, button, tray). Works whether or not saver mode is ON.
+        void ToggleOverlay()
+        {
+            if (overlay.Visible) { overlay.Hide(); overlayPinned = false; }
+            else { ShowOverlay(); overlayPinned = true; }
+        }
+
+        Snap ReadSnap()
+        {
+            Snap s = sensors.Get();
+            if (cfg.ShowFps) fps.Fill(s, cfg.FpsIgnore);
+            return s;
+        }
+
+        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        // Games sometimes grab the top-most slot; take it back.
+        void KeepOverlayOnTop() { SetWindowPos(overlay.Handle, new IntPtr(-1), 0, 0, 0, 0, 0x2 | 0x1 | 0x10 | 0x40); }
         void PlaceOverlay()
         {
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
@@ -638,9 +818,11 @@ namespace UpsPowerSaver
             if (sensors == null) ovLabel.Text = "sensors unavailable";
             else
             {
-                Snap s = sensors.Get();
+                Snap s = ReadSnap();
                 string adv = SummaryText(s);                      // also tracks the peak
-                ovLabel.Text = cfg.OverlayMode == "Simple" ? string.Format("{0:0.0} W", (s.CpuW ?? 0) + (s.GpuW ?? 0)) : adv;
+                string simple = string.Format("{0:0.0} W", (s.CpuW ?? 0) + (s.GpuW ?? 0));
+                if (cfg.ShowFps && s.Fps.HasValue) simple += "  " + s.Fps.Value.ToString("0") + " FPS";
+                ovLabel.Text = cfg.OverlayMode == "Simple" ? simple : adv;
             }
             PlaceOverlay();
         }
@@ -657,17 +839,22 @@ namespace UpsPowerSaver
         {
             hot.UnregisterAll();
             string failed = "";
-            if (cfg.ToggleHotkey == cfg.StatsHotkey) failed += "(both shortcuts are the same) ";
+            string[] keys = { cfg.ToggleHotkey, cfg.StatsHotkey, cfg.OverlayHotkey };
+            if (keys.Distinct().Count() < 3) failed += "(two shortcuts are the same) ";
             else
             {
-                int e1 = hot.Register(1, cfg.ToggleHotkey), e2 = hot.Register(2, cfg.StatsHotkey);
-                Diag.Log("register toggle " + cfg.ToggleHotkey + " -> " + e1 + ", stats " + cfg.StatsHotkey + " -> " + e2);
-                if (e1 != 0) failed += cfg.ToggleHotkey + " ";
-                if (e2 != 0) failed += cfg.StatsHotkey + " ";
+                string log = "register";
+                for (int i = 0; i < 3; i++)
+                {
+                    int e = hot.Register(i + 1, keys[i]);
+                    log += " " + keys[i] + "->" + e;
+                    if (e != 0) failed += keys[i] + " ";
+                }
+                Diag.Log(log);
             }
             if (failed != "") tray.ShowBalloonTip(5000, "UPS Power Saver", "Shortcut not available (used by another program): " + failed + "- change it in Settings.", ToolTipIcon.Warning);
             if (status != null)
-                status.Text = cfg.ToggleHotkey + " = toggle saver mode\r\n" + cfg.StatsHotkey + " = open this window"
+                status.Text = cfg.ToggleHotkey + " = toggle saver mode    " + cfg.OverlayHotkey + " = show/hide overlay\r\n" + cfg.StatsHotkey + " = open this window"
                     + (failed != "" ? "\r\nNOT AVAILABLE (used by another program): " + failed + "- change it in Settings"
                                     : "\r\nClosing this window keeps the app in the tray. Use \"Exit app\" to quit.");
         }
@@ -675,20 +862,24 @@ namespace UpsPowerSaver
         void OnHotkey(int id)
         {
             Diag.Log("hotkey pressed id=" + id);
-            try { if (id == 1) Toggle(); else if (id == 2) ShowMain(); }
+            try { if (id == 1) Toggle(); else if (id == 2) ShowMain(); else if (id == 3) ToggleOverlay(); }
             catch (Exception ex) { Diag.Log("hotkey handler failed: " + ex); }
         }
 
         static string F(double? v, string fmt, string unit) { return v.HasValue ? v.Value.ToString(fmt) + unit : "--"; }
 
-        string SummaryText(Snap s)
+        string SummaryText(Snap s, bool withApp = false)
         {
             double tot = (s.CpuW ?? 0) + (s.GpuW ?? 0);
             if (tot > peak) peak = tot;
             string l1 = string.Format("CPU {0,7} {1,7} {2,5} {3,8} {4,5}", F(s.CpuW, "0.0", "W"), F(s.CpuV, "0.00", "V"), F(s.CpuT, "0", Deg), F(s.CpuClk, "0", "MHz"), F(s.CpuLoad, "0", "%"));
             string l2 = string.Format("GPU {0,7} {1,7} {2,5} {3,8} {4,5}", F(s.GpuW, "0.0", "W"), F(s.GpuV, "0.00", "V"), F(s.GpuT, "0", Deg), F(s.GpuClk, "0", "MHz"), F(s.GpuLoad, "0", "%"));
             string l3 = string.Format("CPU+GPU {0:0.0}W   peak {1:0.0}W", tot, peak);
-            return l1 + "\r\n" + l2 + "\r\n" + l3;
+            string l4 = "";
+            if (cfg.ShowFps)
+                l4 = "\r\n" + (s.Fps.HasValue ? string.Format("FPS {0,5:0} {1,7:0.0}ms{2}", s.Fps.Value, s.FrameMs.Value, withApp ? "  " + s.FpsApp : "")
+                                              : "FPS    --" + (withApp ? "  (no game in the foreground)" : ""));
+            return l1 + "\r\n" + l2 + "\r\n" + l3 + l4;
         }
 
         // ---- main window
@@ -698,7 +889,7 @@ namespace UpsPowerSaver
             main.Text = "UPS Power Saver"; main.Icon = iconOff; main.ClientSize = new Size(680, 700); main.StartPosition = FormStartPosition.CenterScreen;
             main.BackColor = Color.FromArgb(24, 24, 28); main.ForeColor = Color.White;
 
-            Panel top = new Panel { Dock = DockStyle.Top, Height = 206 };
+            Panel top = new Panel { Dock = DockStyle.Top, Height = 240 };
             toggleBtn = new Button { Left = 14, Top = 12, Width = 200, Height = 52, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 12, FontStyle.Bold) };
             toggleBtn.FlatAppearance.BorderSize = 0;
             toggleBtn.Click += delegate { Toggle(); };
@@ -715,7 +906,7 @@ namespace UpsPowerSaver
             exitBtn.FlatAppearance.BorderSize = 0;
             exitBtn.Click += delegate { Quit(); };
             status = new Label { Left = 14, Top = 72, Width = 650, Height = 50, ForeColor = Color.Silver };
-            summary = new Label { Left = 14, Top = 126, Width = 650, Height = 76, Font = new Font("Consolas", 11, FontStyle.Bold), ForeColor = Color.FromArgb(120, 255, 140) };
+            summary = new Label { Left = 14, Top = 126, Width = 650, Height = 110, Font = new Font("Consolas", 11, FontStyle.Bold), ForeColor = Color.FromArgb(120, 255, 140) };
             top.Controls.AddRange(new Control[] { toggleBtn, settingsBtn, ovBtn, modeBtn, exitBtn, status, summary });
 
             lv = new DbListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, HeaderStyle = ColumnHeaderStyle.Nonclickable, BorderStyle = BorderStyle.None };
@@ -776,10 +967,10 @@ namespace UpsPowerSaver
         void UpdateMain()
         {
             if (sensors == null) { summary.Text = "Sensor library failed to load:\r\n" + err; return; }
-            Snap s = sensors.Get();
+            Snap s = ReadSnap();
             string note = "";
             if (s.CpuW.HasValue && s.CpuW.Value == 0) note = "\r\n(CPU watts = 0: is the PawnIO driver installed? Restart Windows once.)";
-            summary.Text = SummaryText(s) + note;
+            summary.Text = SummaryText(s, true) + note;
             foreach (KeyValuePair<string, Sn> kv in itemSensor)
             {
                 double? v = kv.Value.Val;
@@ -823,7 +1014,7 @@ namespace UpsPowerSaver
                 {
                     Power.TurnOff();
                     on = false;
-                    overlay.Hide();
+                    if (!overlayPinned && !cfg.AlwaysOverlay) overlay.Hide();   // stays if you switched it on by hand
                     tray.ShowBalloonTip(3000, "UPS saver mode: OFF", "Normal power restored (CPU + GPU).", ToolTipIcon.Info);
                 }
             }
@@ -839,8 +1030,8 @@ namespace UpsPowerSaver
                 {
                     cfg = f.Result; cfg.Save();
                     RegisterHotkeys(); SyncStartup();
-                    if (on) { Power.Reapply(cfg); if (cfg.ShowOverlay) ShowOverlay(); else overlay.Hide(); }
-                    else if (overlay.Visible) ShowOverlay();
+                    if (on) Power.Reapply(cfg);
+                    if (cfg.AlwaysOverlay || overlayPinned || (on && cfg.ShowOverlay) || overlay.Visible) ShowOverlay(); else overlay.Hide();
                     tray.ShowBalloonTip(2500, "UPS Power Saver", on ? "Settings saved and applied." : "Settings saved. They apply when you switch ON.", ToolTipIcon.Info);
                 }
             }
@@ -863,9 +1054,12 @@ namespace UpsPowerSaver
             try
             {
                 if (showEvent.WaitOne(0)) ShowMain();
+                if (overlay.Visible) KeepOverlayOnTop();
                 tick++;
                 if (tick % 4 != 0) return;
                 bool mainOn = main.Visible && main.WindowState != FormWindowState.Minimized;
+                bool needFps = cfg.ShowFps && (overlay.Visible || mainOn);   // only trace frames while something shows them
+                if (needFps) fps.Start(); else if (fps.Running) fps.Stop();
                 if (!overlay.Visible && !mainOn) return;
                 if (sensors != null) sensors.Update();
                 if (overlay.Visible) UpdateOverlay();
@@ -882,6 +1076,7 @@ namespace UpsPowerSaver
             try
             {
                 timer.Stop();
+                fps.Stop();
                 if (on) Power.TurnOff();
                 hot.UnregisterAll();
                 tray.Visible = false; tray.Dispose();

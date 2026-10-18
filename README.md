@@ -5,7 +5,12 @@ power and stretch your UPS battery time. Press it again when the electricity is 
 on-screen overlay shows live CPU and GPU power draw, and a stats window shows voltages, temperatures and clocks (a
 simpler MSI Afterburner-style monitor).
 
+**Main window** (saver mode on, live sensors, shortcuts, one-click controls):
+
 ![Main window](docs/main-window.png)
+
+**Overlay** (Advanced mode, over a game: saver status, CPU/GPU watts, volts, temperature, clock, load, FPS):
+
 ![Overlay](docs/overlay-advanced.png)
 
 ## Features
